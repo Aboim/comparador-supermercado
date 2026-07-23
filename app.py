@@ -1,4 +1,4 @@
-import threading
+import asyncio
 import flet as ft
 import database as db
 import scraper
@@ -27,7 +27,7 @@ def main(page: ft.Page):
     supermercado_map = {s["id"]: s for s in SUPERMERCADOS}
     produto_selecionado = None
     categoria_filtro = "Todas"
-    scraping_activo = False
+    scraping_lock = asyncio.Lock()
 
     produto_lista = ft.ListView(expand=True, spacing=4, padding=0)
     preco_inputs_container = ft.Column(spacing=8)
@@ -333,29 +333,32 @@ def main(page: ft.Page):
         page.update()
 
     def raspar_cabaz(e):
-        nonlocal scraping_activo
-        if scraping_activo:
+        if scraping_lock.locked():
+            page.snack_bar = ft.SnackBar(ft.Text("Raspagem ja em curso."), bgcolor=COLORS["text_dim"])
+            page.snack_bar.open = True
+            page.update()
             return
-        scraping_activo = True
-        btn_cabaz.disabled = True
-        btn_raspar_todos.disabled = True
-        scraper_progress.visible = True
-        _init_progress("A raspar Cabaz Basico...")
-        page.update()
+        page.run_task(_raspar_cabaz_async())
 
-        def _executar():
-            nonlocal scraping_activo
+    async def _raspar_cabaz_async():
+        nonlocal scraping_lock
+        async with scraping_lock:
+            btn_cabaz.disabled = True
+            btn_raspar_todos.disabled = True
+            scraper_progress.visible = True
+            _init_progress("A raspar Cabaz Basico...")
+            page.update()
+
             try:
                 db.adicionar_cabaz_basico()
-                resultados = scraper.raspar_cabaz_basico(callback=_atualiza_status)
+                resultados = await scraper.raspar_cabaz_basico_async(callback=_atualiza_status)
 
-                # Marcar resultados finais
                 for sm in SUPERMERCADOS:
                     melhor = None
                     for item in resultados:
                         if sm["id"] in item["precos"]:
                             dados = item["precos"][sm["id"]]
-                            if melhor is None or dados["preco"] < melhor["preco"]:
+                            if melhor is None or dados["preco"] < melhor:
                                 melhor = dados["preco"]
                     if melhor:
                         _update_sm_progress(sm["nome"], f"{len([i for i in resultados if sm['id'] in i['precos']])} produtos", preco=melhor, icon=ft.Icons.CHECK_CIRCLE, cor=COLORS["green"])
@@ -378,7 +381,6 @@ def main(page: ft.Page):
                 page.snack_bar = ft.SnackBar(ft.Text(f"Erro na raspagem: {ex}"), bgcolor=COLORS["red"])
                 page.snack_bar.open = True
             finally:
-                scraping_activo = False
                 btn_cabaz.disabled = False
                 btn_raspar_todos.disabled = False
                 scraper_progress.visible = False
@@ -386,11 +388,11 @@ def main(page: ft.Page):
                 carregar_produtos()
                 page.update()
 
-        threading.Thread(target=_executar, daemon=True).start()
-
     def raspar_todos_produtos(e):
-        nonlocal scraping_activo
-        if scraping_activo:
+        if scraping_lock.locked():
+            page.snack_bar = ft.SnackBar(ft.Text("Raspagem ja em curso."), bgcolor=COLORS["text_dim"])
+            page.snack_bar.open = True
+            page.update()
             return
         produtos = db.listar_produtos()
         if not produtos:
@@ -399,17 +401,19 @@ def main(page: ft.Page):
             page.update()
             return
 
-        scraping_activo = True
-        btn_cabaz.disabled = True
-        btn_raspar_todos.disabled = True
-        scraper_progress.visible = True
-        _init_progress(f"A raspar {len(produtos)} produtos...")
-        page.update()
+        page.run_task(_raspar_todos_produtos_async(produtos))
 
-        def _executar():
-            nonlocal scraping_activo
+    async def _raspar_todos_produtos_async(produtos):
+        nonlocal scraping_lock
+        async with scraping_lock:
+            btn_cabaz.disabled = True
+            btn_raspar_todos.disabled = True
+            scraper_progress.visible = True
+            _init_progress(f"A raspar {len(produtos)} produtos...")
+            page.update()
+
             try:
-                precos = scraper.raspar_todos_produtos(produtos, callback=_atualiza_status)
+                precos = await scraper.raspar_todos_produtos_async(produtos, callback=_atualiza_status)
                 count = db.atualizar_precos_por_scraper(precos)
 
                 scraper_progress.value = 1
@@ -426,15 +430,12 @@ def main(page: ft.Page):
                 page.snack_bar = ft.SnackBar(ft.Text(f"Erro na raspagem: {ex}"), bgcolor=COLORS["red"])
                 page.snack_bar.open = True
             finally:
-                scraping_activo = False
                 btn_cabaz.disabled = False
                 btn_raspar_todos.disabled = False
                 scraper_progress.visible = False
                 montar_resumo()
                 carregar_produtos()
                 page.update()
-
-        threading.Thread(target=_executar, daemon=True).start()
 
     # ---- COMPARAR PRODUTO COMUM ----
 
@@ -481,8 +482,7 @@ def main(page: ft.Page):
         page.update()
 
     def raspar_produto_comparar(e):
-        nonlocal scraping_activo
-        if scraping_activo:
+        if scraping_lock.locked():
             page.snack_bar = ft.SnackBar(ft.Text("Raspagem ja em curso."), bgcolor=COLORS["text_dim"])
             page.snack_bar.open = True
             page.update()
@@ -495,33 +495,32 @@ def main(page: ft.Page):
             page.update()
             return
 
-        scraping_activo = True
-        btn_comparar.disabled = True
-        btn_cabaz.disabled = True
-        btn_raspar_todos.disabled = True
-        comparar_resultados.controls.clear()
-        _init_progress(f"A pesquisar '{query}'...")
-        page.update()
+        page.run_task(_raspar_produto_comparar_async(query))
 
-        def _executar():
-            nonlocal scraping_activo
+    async def _raspar_produto_comparar_async(query):
+        nonlocal scraping_lock
+        async with scraping_lock:
+            btn_comparar.disabled = True
+            btn_cabaz.disabled = True
+            btn_raspar_todos.disabled = True
+            comparar_resultados.controls.clear()
+            _init_progress(f"A pesquisar '{query}'...")
+            page.update()
+
             try:
                 def cb_progress(sm, produto, termo, progresso):
                     if sm:
-                        _update_sm_progress(sm, f"Pesquisando...", icon=ft.Icons.SYNC, cor=COLORS["blue"])
+                        _update_sm_progress(sm, "Pesquisando...", icon=ft.Icons.SYNC, cor=COLORS["blue"])
                         page.update()
 
-                resultado = scraper.raspar_produto_comum(query, callback=cb_progress)
+                resultado = await scraper.raspar_produto_comum_async(query, callback=cb_progress)
 
                 precos = resultado.get("precos", {})
 
-                # Marcar resultados
-                entries = []
                 for sm in SUPERMERCADOS:
                     if sm["id"] in precos:
                         dados = precos[sm["id"]]
                         preco = dados["preco"]
-                        entries.append({"sm": sm["nome"], "preco": preco, "id": sm["id"]})
                         _update_sm_progress(sm["nome"], f"OK: {dados.get('nome', query)[:25]}", preco=preco, icon=ft.Icons.CHECK_CIRCLE, cor=COLORS["green"])
                     else:
                         _update_sm_progress(sm["nome"], "Nao encontrado", icon=ft.Icons.ERROR, cor=COLORS["red"])
@@ -549,15 +548,12 @@ def main(page: ft.Page):
                 page.snack_bar = ft.SnackBar(ft.Text(f"Erro: {ex}"), bgcolor=COLORS["red"])
                 page.snack_bar.open = True
             finally:
-                scraping_activo = False
                 btn_comparar.disabled = False
                 btn_cabaz.disabled = False
                 btn_raspar_todos.disabled = False
                 montar_resumo()
                 carregar_produtos()
                 page.update()
-
-        threading.Thread(target=_executar, daemon=True).start()
 
     # ---- UI do Comparar Produto (aqui porque referencia a funcao acima) ----
     comparar_field = ft.TextField(

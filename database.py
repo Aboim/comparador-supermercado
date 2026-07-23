@@ -1,5 +1,6 @@
 import sqlite3
 import os
+import json
 from config import SUPERMERCADOS, CATEGORIAS, CABAZ_BASICO
 
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "precos.db")
@@ -32,9 +33,19 @@ def init_db():
             FOREIGN KEY (produto_id) REFERENCES produtos(id) ON DELETE CASCADE,
             UNIQUE(produto_id, supermercado_id)
         );
+
+        CREATE TABLE IF NOT EXISTS scraping_cache (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            supermercado_id TEXT NOT NULL,
+            termo_pesquisa TEXT NOT NULL,
+            resultado_json TEXT NOT NULL,
+            criado_em TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(supermercado_id, termo_pesquisa)
+        );
     """)
     db.commit()
     db.close()
+    limpar_cache_antigo()
 
 
 def listar_produtos(categoria=None, pesquisa=None):
@@ -299,3 +310,40 @@ def obter_comparativo_produto(produto_id):
     ).fetchall()
     db.close()
     return [dict(r) for r in rows]
+
+
+def get_cache(supermercado_id, termo_pesquisa):
+    db = get_db()
+    row = db.execute(
+        """SELECT resultado_json FROM scraping_cache
+           WHERE supermercado_id = ? AND termo_pesquisa = ?
+           AND criado_em > datetime('now', '-1 day')""",
+        (supermercado_id, termo_pesquisa),
+    ).fetchone()
+    db.close()
+    if row:
+        try:
+            return json.loads(row["resultado_json"])
+        except (json.JSONDecodeError, TypeError):
+            return None
+    return None
+
+
+def set_cache(supermercado_id, termo_pesquisa, resultado):
+    db = get_db()
+    db.execute(
+        """INSERT INTO scraping_cache (supermercado_id, termo_pesquisa, resultado_json)
+           VALUES (?, ?, ?)
+           ON CONFLICT(supermercado_id, termo_pesquisa)
+           DO UPDATE SET resultado_json = ?, criado_em = CURRENT_TIMESTAMP""",
+        (supermercado_id, termo_pesquisa, json.dumps(resultado), json.dumps(resultado)),
+    )
+    db.commit()
+    db.close()
+
+
+def limpar_cache_antigo():
+    db = get_db()
+    db.execute("DELETE FROM scraping_cache WHERE criado_em < datetime('now', '-1 day')")
+    db.commit()
+    db.close()

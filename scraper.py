@@ -1,11 +1,15 @@
 import re
 import json
 import time
+import asyncio
 import logging
 from urllib.parse import quote_plus
 
+import aiohttp
 import requests
 from bs4 import BeautifulSoup
+
+import database as db
 
 from config import (
     SUPERMERCADOS,
@@ -22,6 +26,7 @@ from config import (
 logger = logging.getLogger(__name__)
 
 _session = None
+_aio_session = None
 
 
 def _get_session():
@@ -35,6 +40,21 @@ def _get_session():
             "Accept-Encoding": "gzip, deflate",
         })
     return _session
+
+
+async def _get_aiohttp_session():
+    global _aio_session
+    if _aio_session is None:
+        timeout = aiohttp.ClientTimeout(total=SCRAPER_TIMEOUT)
+        _aio_session = aiohttp.ClientSession(
+            headers={
+                "User-Agent": SCRAPER_USER_AGENT,
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Accept-Language": "pt-PT,pt;q=0.9,en;q=0.8",
+            },
+            timeout=timeout,
+        )
+    return _aio_session
 
 
 def _limpar_preco(texto):
@@ -259,7 +279,219 @@ def _extrair_regex_fallback(soup, query, max_results):
     return resultados
 
 
+# ---------------------------------------------------------------------------
+#  ASYNC implementations (aiohttp) — preferidas
+# ---------------------------------------------------------------------------
+
+async def _raspar_supermercado_http_async(sm_id, query, max_results=SCRAPER_MAX_RESULTS):
+    sm = next((s for s in SUPERMERCADOS if s["id"] == sm_id), None)
+    if not sm:
+        return []
+
+    url = sm["url"].format(query=quote_plus(query))
+
+    try:
+        session = await _get_aiohttp_session()
+        async with session.get(url, allow_redirects=True) as resp:
+            if resp.status != 200:
+                logger.warning(f"{sm['nome']}: HTTP {resp.status}")
+                return []
+            html = await resp.text()
+
+        soup = BeautifulSoup(html, "lxml")
+
+        resultados = _extrair_jsonld(soup)
+        if resultados:
+            return resultados[:max_results]
+
+        selectors_entry = SCRAPER_SELECTORS.get(sm_id)
+        if selectors_entry:
+            resultados = _extrair_com_selectores(soup, selectors_entry, max_results)
+
+        if not resultados:
+            resultados = _extrair_regex_fallback(soup, query, max_results)
+
+        return resultados
+
+    except asyncio.TimeoutError:
+        logger.warning(f"{sm['nome']}: Timeout")
+    except aiohttp.ClientError as e:
+        logger.warning(f"{sm['nome']}: Erro de conexao: {e}")
+    except Exception as e:
+        logger.error(f"{sm['nome']}: Erro: {e}")
+
+    return []
+
+
+async def raspar_supermercado_async(sm_id, query, max_results=SCRAPER_MAX_RESULTS):
+    cached = db.get_cache(sm_id, query)
+    if cached:
+        logger.info(f"Cache hit: {sm_id}/{query}")
+        return cached[:max_results]
+
+    sm = next((s for s in SUPERMERCADOS if s["id"] == sm_id), None)
+    nome_sm = sm["nome"] if sm else sm_id
+
+    resultados = await _raspar_supermercado_http_async(sm_id, query, max_results)
+
+    if not resultados:
+        logger.info(f"{nome_sm}: HTTP sem resultados, a tentar browser...")
+        try:
+            from scraper_playwright import raspar_supermercado_browser
+            resultados = await asyncio.to_thread(
+                raspar_supermercado_browser, sm_id, query, True, max_results
+            )
+        except ImportError:
+            logger.info(f"{nome_sm}: Playwright nao disponivel.")
+        except Exception as e:
+            logger.error(f"{nome_sm}: Erro Playwright: {e}")
+
+    if resultados:
+        db.set_cache(sm_id, query, resultados)
+
+    return resultados
+
+
+async def raspar_produto_comum_async(query, callback=None):
+    total_sm = len(SUPERMERCADOS)
+    resultado = {"query": query, "precos": {}}
+
+    async def scrape_single_store(sm, idx):
+        sm_id = sm["id"]
+        if callback:
+            callback(
+                sm=sm["nome"],
+                produto=query,
+                termo=query,
+                progresso=f"{idx + 1}/{total_sm}",
+            )
+        resultados = await raspar_supermercado_async(sm_id, query, max_results=5)
+        return sm_id, resultados
+
+    tasks = [scrape_single_store(sm, i) for i, sm in enumerate(SUPERMERCADOS)]
+    all_results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    for item in all_results:
+        if isinstance(item, BaseException):
+            continue
+        sm_id, resultados = item
+        if resultados:
+            resultados.sort(key=lambda x: x["preco"])
+            r = resultados[0]
+            if 0.01 <= r["preco"] <= 500:
+                resultado["precos"][sm_id] = {
+                    "preco": r["preco"],
+                    "nome": r.get("nome", query),
+                    "unidade": r.get("unidade", "un"),
+                }
+
+    if callback:
+        callback(sm="", produto=query, termo="", progresso="Concluido")
+
+    return resultado
+
+
+async def raspar_cabaz_basico_async(callback=None):
+    total_produtos = len(CABAZ_BASICO)
+    resultados_cabaz = []
+
+    for i, produto in enumerate(CABAZ_BASICO):
+        item = {
+            "nome": produto["nome"],
+            "categoria": produto["categoria"],
+            "unidade": produto["unidade"],
+            "precos": {},
+        }
+        termos = produto["termos_pesquisa"]
+
+        async def scrape_store_for_cabaz(sm):
+            sm_id = sm["id"]
+            preco_encontrado = None
+            nome_encontrado = None
+
+            for termo in termos:
+                if callback:
+                    callback(
+                        sm=sm["nome"],
+                        produto=produto["nome"],
+                        termo=termo,
+                        progresso=f"{i + 1}/{total_produtos}",
+                    )
+                resultados = await raspar_supermercado_async(sm_id, termo, max_results=5)
+                if resultados:
+                    resultados.sort(key=lambda x: x["preco"])
+                    r = resultados[0]
+                    if 0.01 <= r["preco"] <= 200:
+                        preco_encontrado = r["preco"]
+                        nome_encontrado = r.get("nome", produto["nome"])
+                        break
+                await asyncio.sleep(0.5)
+
+            return sm_id, preco_encontrado, nome_encontrado
+
+        tasks = [scrape_store_for_cabaz(sm) for sm in SUPERMERCADOS]
+        store_results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        for item_result in store_results:
+            if isinstance(item_result, BaseException):
+                continue
+            sm_id, preco_enc, nome_enc = item_result
+            if preco_enc:
+                item["precos"][sm_id] = {
+                    "preco": preco_enc,
+                    "nome": nome_enc or produto["nome"],
+                }
+
+        if item["precos"]:
+            resultados_cabaz.append(item)
+
+    return resultados_cabaz
+
+
+async def raspar_todos_produtos_async(produtos, callback=None):
+    resultados = {}
+    total = len(produtos)
+
+    for i, p in enumerate(produtos):
+        pid = p["id"]
+        nome = p["nome"]
+
+        async def scrape_store(sm):
+            sm_id = sm["id"]
+            if callback:
+                callback(
+                    sm=sm["nome"],
+                    produto=nome,
+                    termo=nome,
+                    progresso=f"{i + 1}/{total}",
+                )
+            res = await raspar_supermercado_async(sm_id, nome, max_results=5)
+            return sm_id, res
+
+        tasks = [scrape_store(sm) for sm in SUPERMERCADOS]
+        store_results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        for item_result in store_results:
+            if isinstance(item_result, BaseException):
+                continue
+            sm_id, res = item_result
+            if res:
+                res.sort(key=lambda x: x["preco"])
+                r = res[0]
+                if 0.01 <= r["preco"] <= 500:
+                    resultados.setdefault(pid, {})[sm_id] = r["preco"]
+
+        await asyncio.sleep(0.4)
+
+    return resultados
+
+
+# ---------------------------------------------------------------------------
+#  SYNC implementations (requests) — deprecated, kept for backwards compat
+# ---------------------------------------------------------------------------
+
 def raspar_supermercado_simples(sm_id, query, max_results=SCRAPER_MAX_RESULTS):
+    # DEPRECATED: use raspar_supermercado_async instead
     sm = next((s for s in SUPERMERCADOS if s["id"] == sm_id), None)
     if not sm:
         return []
@@ -302,6 +534,7 @@ def raspar_supermercado_simples(sm_id, query, max_results=SCRAPER_MAX_RESULTS):
 
 
 def raspar_supermercado(sm_id, query, max_results=SCRAPER_MAX_RESULTS):
+    # DEPRECATED: use raspar_supermercado_async instead
     sm = next((s for s in SUPERMERCADOS if s["id"] == sm_id), None)
     if not sm:
         return []
@@ -322,6 +555,7 @@ def raspar_supermercado(sm_id, query, max_results=SCRAPER_MAX_RESULTS):
 
 
 def raspar_produto_comum(query, callback=None):
+    # DEPRECATED: use raspar_produto_comum_async instead
     total_sm = len(SUPERMERCADOS)
     resultado = {
         "query": query,
@@ -359,6 +593,7 @@ def raspar_produto_comum(query, callback=None):
 
 
 def raspar_cabaz_basico(callback=None):
+    # DEPRECATED: use raspar_cabaz_basico_async instead
     total_produtos = len(CABAZ_BASICO)
     resultados_cabaz = []
 
@@ -409,6 +644,7 @@ def raspar_cabaz_basico(callback=None):
 
 
 def raspar_todos_produtos(produtos, callback=None):
+    # DEPRECATED: use raspar_todos_produtos_async instead
     resultados = {}
     total = len(produtos)
 
