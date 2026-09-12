@@ -1,8 +1,12 @@
 import asyncio
+import logging
 import flet as ft
 import database as db
 import scraper
 from config import COLORS, SUPERMERCADOS, CATEGORIAS
+
+logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 
 
 def _border(color):
@@ -338,7 +342,7 @@ def main(page: ft.Page):
             page.snack_bar.open = True
             page.update()
             return
-        page.run_task(_raspar_cabaz_async())
+        page.run_task(_raspar_cabaz_async)
 
     async def _raspar_cabaz_async():
         nonlocal scraping_lock
@@ -396,18 +400,17 @@ def main(page: ft.Page):
             return
         produtos = db.listar_produtos()
         if not produtos:
-            page.snack_bar = ft.SnackBar(ft.Text("Adiciona produtos primeiro."), bgcolor=COLORS["text_dim"])
-            page.snack_bar.open = True
-            page.update()
-            return
+            db.adicionar_cabaz_basico()
+            produtos = db.listar_produtos()
 
-        page.run_task(_raspar_todos_produtos_async(produtos))
+        page.run_task(_raspar_todos_produtos_async, produtos)
 
     async def _raspar_todos_produtos_async(produtos):
         nonlocal scraping_lock
         async with scraping_lock:
             btn_cabaz.disabled = True
             btn_raspar_todos.disabled = True
+            btn_comparar.disabled = True
             scraper_progress.visible = True
             _init_progress(f"A raspar {len(produtos)} produtos...")
             page.update()
@@ -415,6 +418,13 @@ def main(page: ft.Page):
             try:
                 precos = await scraper.raspar_todos_produtos_async(produtos, callback=_atualiza_status)
                 count = db.atualizar_precos_por_scraper(precos)
+
+                for sm in SUPERMERCADOS:
+                    sm_count = sum(1 for pid_precos in precos.values() if sm["id"] in pid_precos)
+                    if sm_count:
+                        _update_sm_progress(sm["nome"], f"{sm_count} precos", icon=ft.Icons.CHECK_CIRCLE, cor=COLORS["green"])
+                    else:
+                        _update_sm_progress(sm["nome"], "Sem resultados", icon=ft.Icons.ERROR, cor=COLORS["red"])
 
                 scraper_progress.value = 1
                 progress_header.value = f"Concluido! {count} precos actualizados."
@@ -427,11 +437,15 @@ def main(page: ft.Page):
                 page.snack_bar.open = True
             except Exception as ex:
                 progress_header.value = f"Erro: {ex}"
+                for sm in SUPERMERCADOS:
+                    _update_sm_progress(sm["nome"], "Erro", icon=ft.Icons.ERROR, cor=COLORS["red"])
                 page.snack_bar = ft.SnackBar(ft.Text(f"Erro na raspagem: {ex}"), bgcolor=COLORS["red"])
                 page.snack_bar.open = True
+                logger.error(f"Erro raspar todos: {ex}", exc_info=True)
             finally:
                 btn_cabaz.disabled = False
                 btn_raspar_todos.disabled = False
+                btn_comparar.disabled = False
                 scraper_progress.visible = False
                 montar_resumo()
                 carregar_produtos()
@@ -495,7 +509,7 @@ def main(page: ft.Page):
             page.update()
             return
 
-        page.run_task(_raspar_produto_comparar_async(query))
+        page.run_task(_raspar_produto_comparar_async, query)
 
     async def _raspar_produto_comparar_async(query):
         nonlocal scraping_lock
@@ -581,7 +595,7 @@ def main(page: ft.Page):
         [
             ft.Column([
                 ft.Text("Comparador de Precos", size=28, weight="bold", color=COLORS["white"]),
-                ft.Text("Supermercados — Continente, Pingo Doce, Auchan, Minipreco", size=13, color=COLORS["text_dim"]),
+                ft.Text("Supermercados — Continente, Pingo Doce, Auchan", size=13, color=COLORS["text_dim"]),
             ], spacing=2, expand=True),
             ft.IconButton(icon=ft.Icons.DOWNLOAD, tooltip="Importar da Lista de Compras", icon_color=COLORS["text_dim"], on_click=importar_lista),
         ],

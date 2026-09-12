@@ -1,8 +1,6 @@
-import re
-import json
-import time
 import asyncio
 import logging
+import random
 from urllib.parse import quote_plus
 
 import aiohttp
@@ -18,15 +16,20 @@ from config import (
     SCRAPER_MAX_RESULTS,
     SCRAPER_USER_AGENT,
     SCRAPER_SELECTORS,
-    SCRAPER_CATEGORIES,
-    SCRAPER_GENERIC_PRICE_PATTERNS,
-    SCRAPER_JSONLD_KEYWORDS,
+)
+
+from scraper_common import (
+    extrair_resultados,
 )
 
 logger = logging.getLogger(__name__)
 
 _session = None
 _aio_session = None
+
+MAX_RETRIES = 2
+RATE_LIMIT_MIN = 0.6
+RATE_LIMIT_MAX = 1.2
 
 
 def _get_session():
@@ -51,237 +54,16 @@ async def _get_aiohttp_session():
                 "User-Agent": SCRAPER_USER_AGENT,
                 "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
                 "Accept-Language": "pt-PT,pt;q=0.9,en;q=0.8",
+                "Accept-Encoding": "gzip, deflate",
             },
             timeout=timeout,
         )
     return _aio_session
 
 
-def _limpar_preco(texto):
-    if not texto:
-        return None
-    numeros = re.sub(r"[^\d,\.]", "", texto.strip())
-    numeros = numeros.replace(",", ".")
-    try:
-        partes = numeros.split(".")
-        if len(partes) > 1:
-            numeros = "".join(partes[:-1]) + "." + partes[-1]
-        valor = round(float(numeros), 2)
-        return valor
-    except (ValueError, IndexError):
-        return None
+async def _rate_limit():
+    await asyncio.sleep(random.uniform(RATE_LIMIT_MIN, RATE_LIMIT_MAX))
 
-
-def _limpar_nome(texto):
-    if not texto:
-        return ""
-    nome = " ".join(texto.strip().split())
-    nome = re.sub(r'\s+', ' ', nome)
-    return nome
-
-
-def _classificar_categoria(nome):
-    nome_lower = nome.lower()
-    for categoria, palavras in SCRAPER_CATEGORIES.items():
-        for palavra in palavras:
-            if palavra in nome_lower:
-                return categoria
-    return "Mercearia"
-
-
-def _extrair_jsonld(soup):
-    resultados = []
-    scripts = soup.find_all("script", type="application/ld+json")
-    for script in scripts:
-        try:
-            data = json.loads(script.string or "")
-            if isinstance(data, dict):
-                data = [data]
-            if not isinstance(data, list):
-                continue
-            for item in data:
-                if not isinstance(item, dict):
-                    continue
-                tipo = item.get("@type", "")
-                if any(kw.lower() in str(tipo).lower() for kw in SCRAPER_JSONLD_KEYWORDS):
-                    nome = item.get("name", "")
-                    if not nome:
-                        continue
-                    oferta = item.get("offers", {})
-                    if isinstance(oferta, list):
-                        oferta = oferta[0] if oferta else {}
-                    preco = oferta.get("price") if isinstance(oferta, dict) else None
-                    if preco:
-                        try:
-                            preco_val = float(preco)
-                            if 0.01 <= preco_val <= 500:
-                                resultados.append({
-                                    "nome": _limpar_nome(nome),
-                                    "preco": preco_val,
-                                    "unidade": "un",
-                                    "categoria": _classificar_categoria(nome),
-                                })
-                        except (ValueError, TypeError):
-                            pass
-        except (json.JSONDecodeError, TypeError):
-            continue
-    return resultados
-
-
-def _relevancia_match(nome_produto, query):
-    nome = nome_produto.lower()
-    termos = query.lower().split()
-    score = sum(1 for t in termos if t in nome)
-    return score
-
-
-def _extrair_com_selectores(soup, selectors_entry, max_results):
-    resultados = []
-    if not selectors_entry:
-        return resultados
-
-    item_selector = selectors_entry.get("item", "")
-    if not item_selector:
-        return resultados
-
-    try:
-        items = soup.select(item_selector)
-    except Exception:
-        return resultados
-
-    for item in items[:max_results * 3]:
-        nome = None
-        preco = None
-        unidade = "un"
-
-        for name_sel in [s.strip() for s in selectors_entry.get("name", "").split(",") if s.strip()]:
-            try:
-                elem = item.select_one(name_sel)
-                if elem:
-                    nome = _limpar_nome(elem.get_text())
-                    if nome:
-                        break
-            except Exception:
-                continue
-
-        for price_sel in [s.strip() for s in selectors_entry.get("price", "").split(",") if s.strip()]:
-            try:
-                elem = item.select_one(price_sel)
-                if elem:
-                    preco = _limpar_preco(elem.get_text())
-                    if preco and preco > 0:
-                        break
-            except Exception:
-                continue
-
-        for unit_sel in [s.strip() for s in selectors_entry.get("unit", "").split(",") if s.strip()]:
-            try:
-                elem = item.select_one(unit_sel)
-                if elem:
-                    unidade = _limpar_nome(elem.get_text()) or "un"
-                    break
-            except Exception:
-                continue
-
-        if nome and preco and 0.01 <= preco <= 500:
-            resultados.append({
-                "nome": nome,
-                "preco": preco,
-                "unidade": unidade,
-                "categoria": _classificar_categoria(nome),
-            })
-
-        if len(resultados) >= max_results:
-            break
-
-    return resultados
-
-
-def _extrair_regex_fallback(soup, query, max_results):
-    resultados = []
-    texto = soup.get_text(separator=" ", strip=True)
-
-    # Encontrar todos os precos em formato EUR
-    precos_brutos = re.findall(r'(\d+[.,]\d{2})\s*€', texto)
-    if not precos_brutos:
-        precos_brutos = re.findall(r'€\s*(\d+[.,]\d{2})', texto)
-    if not precos_brutos:
-        precos_brutos = re.findall(r'(\d+[.,]\d{2})', texto)
-
-    precos_validos = []
-    for p in precos_brutos:
-        preco = _limpar_preco(p)
-        if preco and 0.01 <= preco <= 500:
-            precos_validos.append(preco)
-
-    if not precos_validos:
-        return resultados
-
-    # Palavras de lixo para filtrar
-    noise_words = {
-        "skip", "main", "content", "resultado", "pesquisa", "online", "aceitar",
-        "cookie", "cookies", "navegar", "continuar", "login", "registo", "registe",
-        "menu", "footer", "header", "breadcrumb", "search", "encontrado", "encontrados",
-        "produto", "produtos", "carrinho", "compras", "favorito", "wishlist",
-        "subscrever", "newsletter", "promocao", "promocoes", "folheto",
-        "loja", "lojas", "contacto", "contactos", "ajuda", "sobre", "politica",
-        "privacidade", "termos", "condicoes",
-    }
-
-    linhas = texto.split("\n")
-    for linha in linhas:
-        linha_limpa = linha.strip()
-        if len(linha_limpa) < 5:
-            continue
-
-        preco_str = re.search(r'(\d+[.,]\d{2})', linha_limpa)
-        if not preco_str:
-            continue
-        preco = _limpar_preco(preco_str.group(1))
-        if preco not in precos_validos:
-            continue
-
-        # Limpar nome: remover precos e caracteres especiais
-        nome_tmp = re.sub(r'\d+[.,]\d{2}\s*€?', '', linha_limpa)
-        nome_tmp = re.sub(r'[^\w\s%\-]', ' ', nome_tmp)
-        nome_tmp = _limpar_nome(nome_tmp)
-
-        # Filtrar lixo
-        palavras = set(nome_tmp.lower().split())
-        if len(palavras) <= 1:
-            continue
-        if any(w in noise_words for w in palavras):
-            continue
-        if len(nome_tmp) < 5 or len(nome_tmp) > 80:
-            continue
-        if nome_tmp.lower() in noise_words:
-            continue
-
-        resultados.append({
-            "nome": nome_tmp[:80],
-            "preco": preco,
-            "unidade": "un",
-            "categoria": _classificar_categoria(nome_tmp),
-        })
-
-        if len(resultados) >= max_results:
-            break
-
-    # Se o fallback regex nao produziu nomes validos, usar a query
-    if not resultados and precos_validos:
-        resultados.append({
-            "nome": query.title(),
-            "preco": precos_validos[0],
-            "unidade": "un",
-            "categoria": _classificar_categoria(query),
-        })
-
-    return resultados
-
-
-# ---------------------------------------------------------------------------
-#  ASYNC implementations (aiohttp) — preferidas
-# ---------------------------------------------------------------------------
 
 async def _raspar_supermercado_http_async(sm_id, query, max_results=SCRAPER_MAX_RESULTS):
     sm = next((s for s in SUPERMERCADOS if s["id"] == sm_id), None)
@@ -289,36 +71,39 @@ async def _raspar_supermercado_http_async(sm_id, query, max_results=SCRAPER_MAX_
         return []
 
     url = sm["url"].format(query=quote_plus(query))
+    selectors_entry = SCRAPER_SELECTORS.get(sm_id)
 
-    try:
-        session = await _get_aiohttp_session()
-        async with session.get(url, allow_redirects=True) as resp:
-            if resp.status != 200:
-                logger.warning(f"{sm['nome']}: HTTP {resp.status}")
-                return []
-            html = await resp.text()
+    for attempt in range(MAX_RETRIES + 1):
+        try:
+            session = await _get_aiohttp_session()
+            async with session.get(url, allow_redirects=True) as resp:
+                if resp.status != 200:
+                    logger.warning(f"{sm['nome']}: HTTP {resp.status}")
+                    if attempt < MAX_RETRIES:
+                        await asyncio.sleep(1 + attempt)
+                        continue
+                    return []
+                html = await resp.text()
 
-        soup = BeautifulSoup(html, "lxml")
+            soup = BeautifulSoup(html, "lxml")
+            resultados = extrair_resultados(soup, sm_id, query, selectors_entry, max_results)
 
-        resultados = _extrair_jsonld(soup)
-        if resultados:
-            return resultados[:max_results]
+            if resultados:
+                return resultados
+            if attempt < MAX_RETRIES:
+                await asyncio.sleep(1 + attempt)
 
-        selectors_entry = SCRAPER_SELECTORS.get(sm_id)
-        if selectors_entry:
-            resultados = _extrair_com_selectores(soup, selectors_entry, max_results)
-
-        if not resultados:
-            resultados = _extrair_regex_fallback(soup, query, max_results)
-
-        return resultados
-
-    except asyncio.TimeoutError:
-        logger.warning(f"{sm['nome']}: Timeout")
-    except aiohttp.ClientError as e:
-        logger.warning(f"{sm['nome']}: Erro de conexao: {e}")
-    except Exception as e:
-        logger.error(f"{sm['nome']}: Erro: {e}")
+        except asyncio.TimeoutError:
+            logger.warning(f"{sm['nome']}: Timeout (tentativa {attempt + 1})")
+            if attempt < MAX_RETRIES:
+                await asyncio.sleep(1 + attempt)
+        except aiohttp.ClientError as e:
+            logger.warning(f"{sm['nome']}: Erro de conexao: {e}")
+            if attempt < MAX_RETRIES:
+                await asyncio.sleep(2 + attempt)
+        except Exception as e:
+            logger.error(f"{sm['nome']}: Erro: {e}")
+            break
 
     return []
 
@@ -349,6 +134,7 @@ async def raspar_supermercado_async(sm_id, query, max_results=SCRAPER_MAX_RESULT
     if resultados:
         db.set_cache(sm_id, query, resultados)
 
+    await _rate_limit()
     return resultados
 
 
@@ -490,51 +276,50 @@ async def raspar_todos_produtos_async(produtos, callback=None):
 #  SYNC implementations (requests) — deprecated, kept for backwards compat
 # ---------------------------------------------------------------------------
 
+import time
+
 def raspar_supermercado_simples(sm_id, query, max_results=SCRAPER_MAX_RESULTS):
-    # DEPRECATED: use raspar_supermercado_async instead
     sm = next((s for s in SUPERMERCADOS if s["id"] == sm_id), None)
     if not sm:
         return []
 
     url = sm["url"].format(query=quote_plus(query))
-    resultados = []
+    selectors_entry = SCRAPER_SELECTORS.get(sm_id)
 
-    try:
-        session = _get_session()
-        resp = session.get(url, timeout=SCRAPER_TIMEOUT, allow_redirects=True)
-        if resp.status_code != 200:
-            logger.warning(f"{sm['nome']}: HTTP {resp.status_code}")
-            return []
+    for attempt in range(MAX_RETRIES + 1):
+        try:
+            session = _get_session()
+            resp = session.get(url, timeout=SCRAPER_TIMEOUT, allow_redirects=True)
+            if resp.status_code != 200:
+                logger.warning(f"{sm['nome']}: HTTP {resp.status_code}")
+                if attempt < MAX_RETRIES:
+                    time.sleep(1 + attempt)
+                    continue
+                return []
 
-        soup = BeautifulSoup(resp.text, "lxml")
+            soup = BeautifulSoup(resp.text, "lxml")
+            resultados = extrair_resultados(soup, sm_id, query, selectors_entry, max_results)
+            if resultados:
+                return resultados
+            if attempt < MAX_RETRIES:
+                time.sleep(1 + attempt)
 
-        # 1) Tentar extrair JSON-LD
-        resultados = _extrair_jsonld(soup)
-        if resultados:
-            resultados = resultados[:max_results]
-            return resultados
+        except requests.Timeout:
+            logger.warning(f"{sm['nome']}: Timeout")
+            if attempt < MAX_RETRIES:
+                time.sleep(1 + attempt)
+        except requests.ConnectionError:
+            logger.warning(f"{sm['nome']}: Erro de conexao")
+            if attempt < MAX_RETRIES:
+                time.sleep(2 + attempt)
+        except Exception as e:
+            logger.error(f"{sm['nome']}: Erro: {e}")
+            break
 
-        # 2) Tentar selectores CSS
-        selectors_entry = SCRAPER_SELECTORS.get(sm_id)
-        if selectors_entry:
-            resultados = _extrair_com_selectores(soup, selectors_entry, max_results)
-
-        # 3) Fallback regex
-        if not resultados:
-            resultados = _extrair_regex_fallback(soup, query, max_results)
-
-    except requests.Timeout:
-        logger.warning(f"{sm['nome']}: Timeout")
-    except requests.ConnectionError:
-        logger.warning(f"{sm['nome']}: Erro de conexao")
-    except Exception as e:
-        logger.error(f"{sm['nome']}: Erro: {e}")
-
-    return resultados
+    return []
 
 
 def raspar_supermercado(sm_id, query, max_results=SCRAPER_MAX_RESULTS):
-    # DEPRECATED: use raspar_supermercado_async instead
     sm = next((s for s in SUPERMERCADOS if s["id"] == sm_id), None)
     if not sm:
         return []
@@ -555,12 +340,8 @@ def raspar_supermercado(sm_id, query, max_results=SCRAPER_MAX_RESULTS):
 
 
 def raspar_produto_comum(query, callback=None):
-    # DEPRECATED: use raspar_produto_comum_async instead
     total_sm = len(SUPERMERCADOS)
-    resultado = {
-        "query": query,
-        "precos": {},
-    }
+    resultado = {"query": query, "precos": {}}
 
     for i, sm in enumerate(SUPERMERCADOS):
         sm_id = sm["id"]
@@ -593,7 +374,6 @@ def raspar_produto_comum(query, callback=None):
 
 
 def raspar_cabaz_basico(callback=None):
-    # DEPRECATED: use raspar_cabaz_basico_async instead
     total_produtos = len(CABAZ_BASICO)
     resultados_cabaz = []
 
@@ -604,7 +384,6 @@ def raspar_cabaz_basico(callback=None):
             "unidade": produto["unidade"],
             "precos": {},
         }
-
         termos = produto["termos_pesquisa"]
 
         for sm in SUPERMERCADOS:
@@ -628,7 +407,6 @@ def raspar_cabaz_basico(callback=None):
                         preco_encontrado = r["preco"]
                         nome_encontrado = r.get("nome", produto["nome"])
                         break
-
                 time.sleep(0.5)
 
             if preco_encontrado:
@@ -644,7 +422,6 @@ def raspar_cabaz_basico(callback=None):
 
 
 def raspar_todos_produtos(produtos, callback=None):
-    # DEPRECATED: use raspar_todos_produtos_async instead
     resultados = {}
     total = len(produtos)
 

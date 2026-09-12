@@ -19,12 +19,9 @@ SUPERMERCADOS = [
      "url": "https://www.continente.pt/pesquisa/?q={query}",
      "needs_js": True},
     {"id": "pingo_doce", "nome": "Pingo Doce", "cor": "#EF4444", "icone": "\U0001f6d2",
-     "url": "https://www.pingodoce.pt/pesquisa/?q={query}",
+     "url": "https://www.pingodoce.pt/on/demandware.store/Sites-pingo-doce-Site/default/Search-Show?q={query}",
      "needs_js": True},
     {"id": "auchan", "nome": "Auchan", "cor": "#EF4444", "icone": "\U0001f6d2",
-     "url": "https://www.auchan.pt/pt/pesquisa?q={query}",
-     "needs_js": False},
-    {"id": "minipreco", "nome": "Minipreco", "cor": "#3B82F6", "icone": "\U0001f3ea",
      "url": "https://www.auchan.pt/pt/pesquisa?q={query}",
      "needs_js": False},
 ]
@@ -122,12 +119,6 @@ SCRAPER_SELECTORS = {
         "unit": ".product-item__unit, [class*='unit'], [class*='quantity']",
     },
     "auchan": {
-        "item": ".product-card, [class*='product'][class*='card'], .product-thumbnail",
-        "name": ".product-card__title, [class*='product'][class*='title'], [class*='name'], h3",
-        "price": ".product-price__value, [class*='price'] [class*='value'], [class*='Price-value']",
-        "unit": ".product-price__unit, [class*='unit'], [class*='quantity']",
-    },
-    "minipreco": {
         "item": ".product-card, [class*='product'][class*='card'], .product-thumbnail",
         "name": ".product-card__title, [class*='product'][class*='title'], [class*='name'], h3",
         "price": ".product-price__value, [class*='price'] [class*='value'], [class*='Price-value']",

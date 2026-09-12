@@ -1,6 +1,16 @@
 # Comparador de Precos de Supermercado
 
-Compara precos entre os principais supermercados portugueses e descobre qual fica mais barato no total.
+Compara precos entre os supermercados portugueses com loja online e descobre qual fica mais barato no total.
+
+## Supermercados
+
+| Supermercado | Scraping | Status |
+|---|---|---|
+| Continente | JS (Playwright) | Funcional |
+| Pingo Doce | JS (Playwright) | Funcional |
+| Auchan | HTTP | Funcional |
+
+Supermercados sem loja online ou com bloqueios anti-bot foram removidos (Minipreco, Aldi, Lidl, Mercadona, Intermarche).
 
 ## Stack
 
@@ -11,16 +21,12 @@ Compara precos entre os principais supermercados portugueses e descobre qual fic
 ## Funcionalidades
 
 - Adicionar/editar/apagar produtos com categoria
-- Registar precos por produto e supermercado (8 supermercados)
+- Registar precos por produto e supermercado (3 supermercados)
 - Destaque automatico do supermercado mais barato por produto
 - Resumo com total por supermercado e poupanca maxima
 - Filtro por categoria e pesquisa
 - Importacao automatica de produtos da **Lista de Compras**
 - Tema escuro
-
-## Supermercados
-
-Continente, Pingo Doce, Auchan, Lidl, Aldi, Mercadona, Minipreco, Intermarche
 
 ## Instalacao
 
@@ -39,10 +45,10 @@ python app.py
 
 A app pesquisa automaticamente nos sites dos supermercados:
 
-- **Cabaz Basico:** 20 produtos essenciais pre-definidos (leite, pao, ovos, arroz, massa, fruta, carne, etc.)
+- **Cabaz Basico:** 28 produtos essenciais pre-definidos (leite, pao, ovos, arroz, massa, fruta, carne, etc.)
 - **Raspar Todos:** pesquisa precos para todos os produtos ja adicionados
-- Usa `requests` + `BeautifulSoup` para sites leves
-- Fallback automatico para **Playwright** (Chromium) em sites com JavaScript
+- Usa `requests` + `BeautifulSoup` para sites leves (Auchan)
+- **Playwright** (Chromium) para sites com JavaScript (Continente, Pingo Doce)
 - Progresso em tempo real na interface
 
 O scraping depende da estrutura atual dos sites. Se os sites mudarem, os selectores CSS em `config.py` (`SCRAPER_SELECTORS`) precisam de ser actualizados.
